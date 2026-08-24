@@ -251,6 +251,9 @@
     pointer-events: none !important;
   }
 </style>
+<!-- Biblioteca usada para converter os relatórios (HTML) em PDF de verdade dentro do próprio
+     app, sem depender de window.print() — que não funciona dentro do WebViewer do Kodular. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.9.3/html2pdf.bundle.min.js"></script>
 </head>
 <body class="pre-login">
 
@@ -3563,7 +3566,103 @@ function esc(s) { const d = document.createElement("div"); d.textContent = Strin
 // document.write). Isso evita um bug comum em navegadores mobile onde o meta viewport
 // escrito via document.write é ignorado, fazendo o relatório abrir "zoomado"/desalinhado
 // em vez de se ajustar à largura da tela do celular.
+// Detecta se o app está rodando dentro do WebViewer do Kodular (ponte window.Kodular
+// disponível apenas lá, nunca em um navegador comum como Chrome/Safari).
+function estaDentroDoKodular() {
+  return !!(window.Kodular && typeof window.Kodular.setWebViewString === "function");
+}
+
+// Mostra um overlay simples de "gerando PDF..." enquanto o html2pdf.js processa o relatório
+// (a conversão pode levar de 1 a alguns segundos em relatórios grandes/com muitas páginas).
+function mostrarOverlayGerandoPdf() {
+  let overlay = document.getElementById("overlayGerandoPdf");
+  if (overlay) return overlay;
+  overlay = document.createElement("div");
+  overlay.id = "overlayGerandoPdf";
+  overlay.style.cssText = "position:fixed; inset:0; background:rgba(20,56,83,0.9); display:flex; align-items:center; justify-content:center; z-index:99999; flex-direction:column; color:#fff; font-family:Arial, sans-serif;";
+  overlay.innerHTML = `<div style="font-size:34px; margin-bottom:10px;">📄</div><div style="font-size:14px; font-weight:700;">Gerando PDF do relatório...</div><div style="font-size:11.5px; color:#C9DAE7; margin-top:4px;">Isso pode levar alguns segundos.</div>`;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+function removerOverlayGerandoPdf() {
+  const overlay = document.getElementById("overlayGerandoPdf");
+  if (overlay) overlay.remove();
+}
+
+// Recebe o HTML completo de um relatório (o mesmo que antes era aberto em uma nova aba com
+// window.open) e converte esse HTML em um PDF de verdade, inteiramente no próprio JavaScript,
+// usando um <iframe> oculto para renderizar o layout com todo o CSS do relatório aplicado.
+// O PDF final (em base64) é entregue ao app nativo do Kodular através de
+// window.Kodular.setWebViewString(), prefixado com "PDF_RELATORIO_BASE64::" para que o bloco
+// correspondente no Kodular (evento WebViewer1.WebViewStringChanged) saiba reconhecer esse
+// conteúdo, decodificar o base64, salvar como arquivo .pdf e abrir o menu nativo de
+// compartilhar/imprimir do Android — que tem suporte completo a impressão, diferente do
+// WebViewer sozinho.
+function enviarRelatorioComoPdfParaKodular(html) {
+  mostrarOverlayGerandoPdf();
+
+  const iframe = document.createElement("iframe");
+  iframe.style.cssText = "position:fixed; left:-1px; top:-1px; width:900px; height:1px; opacity:0; pointer-events:none;";
+  document.body.appendChild(iframe);
+
+  const finalizarComErro = (msg) => {
+    removerOverlayGerandoPdf();
+    if (iframe.parentNode) iframe.remove();
+    alert("Não foi possível gerar o PDF deste relatório.\n\n" + msg);
+  };
+
+  iframe.onload = () => {
+    // Pequeno atraso para garantir que o layout do relatório já foi calculado pelo navegador
+    // antes de mandar o html2canvas "fotografar" o conteúdo.
+    setTimeout(() => {
+      try {
+        if (!window.html2pdf) { finalizarComErro("Biblioteca html2pdf.js não carregou (verifique a conexão com a internet na primeira abertura)."); return; }
+        const doc = iframe.contentDocument;
+        // Os botões "Voltar ao sistema" / "Imprimir" do relatório não fazem sentido aqui —
+        // a entrega do PDF passa a ser feita pelo próprio Android — então são ocultados
+        // apenas dentro do PDF gerado (o relatório em si continua com esses botões quando
+        // aberto normalmente em um navegador, veja o fallback mais abaixo).
+        const barraAcoes = doc.querySelector(".barra-acoes");
+        if (barraAcoes) barraAcoes.style.display = "none";
+
+        const alvo = doc.body;
+        const opcoes = {
+          margin: 0,
+          filename: "relatorio.pdf",
+          image: { type: "jpeg", quality: 0.98 },
+          html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
+          jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+          pagebreak: { mode: ["css", "legacy"] },
+        };
+
+        window.html2pdf().set(opcoes).from(alvo).outputPdf("datauristring").then((pdfDataUri) => {
+          const base64 = String(pdfDataUri).split(",")[1];
+          removerOverlayGerandoPdf();
+          iframe.remove();
+          if (!base64) { finalizarComErro("O PDF foi gerado vazio."); return; }
+          window.Kodular.setWebViewString("PDF_RELATORIO_BASE64::" + base64);
+        }).catch((erro) => {
+          finalizarComErro(String(erro && erro.message ? erro.message : erro));
+        });
+      } catch (erro) {
+        finalizarComErro(String(erro && erro.message ? erro.message : erro));
+      }
+    }, 350);
+  };
+
+  iframe.srcdoc = html;
+}
+
+// Ponto de entrada único usado por todos os relatórios do sistema. Dentro do app Kodular, gera
+// o PDF e entrega pro Android (ver enviarRelatorioComoPdfParaKodular). Fora do Kodular — por
+// exemplo, ao testar este mesmo arquivo direto num navegador de computador — mantém o
+// comportamento antigo (abre em nova aba, com os botões de Voltar/Imprimir funcionando
+// normalmente via recursos nativos do navegador).
 function abrirRelatorioHtml(html) {
+  if (estaDentroDoKodular()) {
+    enviarRelatorioComoPdfParaKodular(html);
+    return null;
+  }
   const blob = new Blob([html], { type: "text/html" });
   const url = URL.createObjectURL(blob);
   const win = window.open(url, "_blank");
