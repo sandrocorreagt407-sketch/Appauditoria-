@@ -3601,23 +3601,49 @@ function removerOverlayGerandoPdf() {
 function enviarRelatorioComoPdfParaKodular(html) {
   mostrarOverlayGerandoPdf();
 
+  let concluido = false; // trava contra dupla execução (onload + fallback) e contra o watchdog disparar depois do sucesso
+
   const iframe = document.createElement("iframe");
   iframe.style.cssText = "position:fixed; left:-1px; top:-1px; width:900px; height:1px; opacity:0; pointer-events:none;";
   document.body.appendChild(iframe);
 
+  const limparIframe = () => { if (iframe.parentNode) iframe.remove(); };
+
   const finalizarComErro = (msg) => {
+    if (concluido) return;
+    concluido = true;
+    clearTimeout(watchdog);
     removerOverlayGerandoPdf();
-    if (iframe.parentNode) iframe.remove();
-    alert("Não foi possível gerar o PDF deste relatório.\n\n" + msg);
+    limparIframe();
+    alert(
+      "Não foi possível gerar o PDF deste relatório.\n\n" + msg +
+      "\n\nSe este relatório tiver MUITOS itens (centenas ou milhares), tente antes:\n" +
+      "• Marcar a opção \"Não incluir a tabela de detalhamento\" (na Auditoria), ou\n" +
+      "• Usar um filtro pra reduzir a quantidade de itens antes de gerar o PDF."
+    );
   };
 
-  iframe.onload = () => {
+  // Rede de segurança: nunca deixa o app "travado" esperando pra sempre. Relatórios com muitos
+  // itens (centenas/milhares de linhas) podem demorar muito ou estourar a memória do aparelho
+  // ao tentar desenhar tudo como uma imagem — depois desse tempo, desiste e avisa o usuário
+  // em vez de ficar com a tela presa no "Gerando PDF...".
+  const watchdog = setTimeout(() => {
+    finalizarComErro("A geração demorou demais — provavelmente o relatório tem itens demais para processar como imagem neste aparelho.");
+  }, 25000);
+
+  let jaProcessou = false;
+  const processarConteudo = () => {
+    if (jaProcessou || concluido) return;
+    jaProcessou = true;
     // Pequeno atraso para garantir que o layout do relatório já foi calculado pelo navegador
     // antes de mandar o html2canvas "fotografar" o conteúdo.
     setTimeout(() => {
       try {
-        if (!window.html2pdf) { finalizarComErro("Biblioteca html2pdf.js não carregou (verifique a conexão com a internet na primeira abertura)."); return; }
+        if (concluido) return;
+        if (!window.html2pdf) { finalizarComErro("Biblioteca html2pdf.js não carregou (verifique a conexão com a internet nesta primeira abertura)."); return; }
         const doc = iframe.contentDocument;
+        if (!doc || !doc.body) { finalizarComErro("Não foi possível acessar o conteúdo do relatório dentro do WebView."); return; }
+
         // Os botões "Voltar ao sistema" / "Imprimir" do relatório não fazem sentido aqui —
         // a entrega do PDF passa a ser feita pelo próprio Android — então são ocultados
         // apenas dentro do PDF gerado (o relatório em si continua com esses botões quando
@@ -3629,17 +3655,22 @@ function enviarRelatorioComoPdfParaKodular(html) {
         const opcoes = {
           margin: 0,
           filename: "relatorio.pdf",
-          image: { type: "jpeg", quality: 0.98 },
-          html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
+          image: { type: "jpeg", quality: 0.92 },
+          // scale mais baixo = imagem final bem mais leve e mais rápido de processar num
+          // celular; importante em relatórios com muitas linhas (ex.: milhares de itens).
+          html2canvas: { scale: 1, useCORS: true, backgroundColor: "#ffffff", logging: false },
           jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
           pagebreak: { mode: ["css", "legacy"] },
         };
 
         window.html2pdf().set(opcoes).from(alvo).outputPdf("datauristring").then((pdfDataUri) => {
+          if (concluido) return;
+          concluido = true;
+          clearTimeout(watchdog);
           const base64 = String(pdfDataUri).split(",")[1];
           removerOverlayGerandoPdf();
-          iframe.remove();
-          if (!base64) { finalizarComErro("O PDF foi gerado vazio."); return; }
+          limparIframe();
+          if (!base64) { alert("O PDF foi gerado, mas ficou vazio. Tente novamente."); return; }
           window.Kodular.setWebViewString("PDF_RELATORIO_BASE64::" + base64);
         }).catch((erro) => {
           finalizarComErro(String(erro && erro.message ? erro.message : erro));
@@ -3650,7 +3681,11 @@ function enviarRelatorioComoPdfParaKodular(html) {
     }, 350);
   };
 
+  iframe.onload = processarConteudo;
   iframe.srcdoc = html;
+  // Alguns WebViews não disparam onload de forma confiável para iframes com "srcdoc" — esse
+  // fallback garante que o processamento aconteça mesmo assim, depois de um tempo mínimo.
+  setTimeout(processarConteudo, 1500);
 }
 
 // Ponto de entrada único usado por todos os relatórios do sistema. Dentro do app Kodular, gera
